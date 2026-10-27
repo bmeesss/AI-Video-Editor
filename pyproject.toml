@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-video-editor"
+version = "0.1.0"
+description = "Free, local AI-assisted gaming video analysis and editable Kdenlive project generator for OpenCode"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "AI-Video-Editor Contributors" }
+]
+keywords = ["kdenlive", "video-editing", "opencode", "whisper", "gaming", "mlt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "av>=12.0.0",
+    "imageio-ffmpeg>=0.4.9",
+    "faster-whisper>=1.0.0",
+    "onnxruntime>=1.16.0",
+    "scenedetect>=0.6.3",
+    "opencv-python-headless>=4.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "lxml>=4.9.0",
+]
+
+[project.scripts]
+ai-video-editor = "ai_video_editor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v"
