@@ -172,6 +172,7 @@ class TranscriptSegment:
     confidence: float
     words: List[TranscriptWord] = field(default_factory=list)
     is_stumble_candidate: bool = False
+    stumble_confidence: float = 0.0
     stumble_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -183,6 +184,7 @@ class TranscriptSegment:
             "confidence": self.confidence,
             "words": [w.to_dict() for w in self.words],
             "is_stumble_candidate": self.is_stumble_candidate,
+            "stumble_confidence": self.stumble_confidence,
             "stumble_reason": self.stumble_reason,
         }
 
@@ -196,6 +198,7 @@ class TranscriptSegment:
             confidence=float(data["confidence"]),
             words=[TranscriptWord.from_dict(w) for w in data.get("words", [])],
             is_stumble_candidate=bool(data.get("is_stumble_candidate", False)),
+            stumble_confidence=float(data.get("stumble_confidence", 0.0)),
             stumble_reason=str(data.get("stumble_reason", "")),
         )
 
@@ -288,10 +291,14 @@ class AnalysisReport:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
-    def save_json(self, path: Path) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_json(indent=2), encoding="utf-8", newline="\n")
-        return path
+    def save_json(self, path: Path | str) -> Path:
+        from .safety import safe_write_text
+
+        return safe_write_text(
+            path,
+            self.to_json(indent=2),
+            source_path=self.media_info.path if self.media_info.path else None,
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AnalysisReport":
@@ -466,10 +473,14 @@ class EditDecisionModel:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
-    def save_json(self, path: Path) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_json(indent=2), encoding="utf-8", newline="\n")
-        return path
+    def save_json(self, path: Path | str) -> Path:
+        from .safety import safe_write_text
+
+        return safe_write_text(
+            path,
+            self.to_json(indent=2),
+            source_path=self.source_media.path if self.source_media.path else None,
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EditDecisionModel":

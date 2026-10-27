@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import math
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -31,6 +33,7 @@ class WhisperRuntimeSelection:
     cpu_cores: int
     cuda_available: bool
     rationale: str
+    gpu_vram_gb: Optional[float] = None
 
 
 def get_system_ram_gb() -> float:
@@ -67,24 +70,112 @@ def get_system_ram_gb() -> float:
     return 8.0
 
 
-def is_cuda_available() -> bool:
-    """Safely check whether CTranslate2 detects a usable CUDA GPU."""
+def get_gpu_vram_gb() -> Optional[float]:
+    """Query total GPU VRAM in GiB via nvidia-smi if available, returning None on failure."""
     try:
-        return int(ctranslate2.get_cuda_device_count()) > 0
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            first_line = proc.stdout.strip().splitlines()[0].strip()
+            mib = float(first_line)
+            if mib > 0:
+                return round(mib / 1024.0, 2)
     except Exception:
-        return False
+        pass
+    return None
 
 
-def select_whisper_model_and_device(config: EditingConfig) -> WhisperRuntimeSelection:
-    """Select between Whisper 'base' and 'small' and CPU/CUDA with safe CPU fallback."""
-    ram_gb = get_system_ram_gb()
-    cores = os.cpu_count() or 4
-    cuda_ok = is_cuda_available()
+def _can_load_cublas_runtime() -> bool:
+    """Verify that the CUDA cuBLAS runtime library required by CTranslate2 can actually be loaded."""
+    if os.name == "nt":
+        candidates = ["cublas64_12.dll", "cublas64_11.dll"]
+    else:
+        candidates = ["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
+
+    for lib_name in candidates:
+        try:
+            ctypes.CDLL(lib_name)
+            return True
+        except Exception:
+            continue
+
+    found = ctypes.util.find_library("cublas")
+    if found:
+        try:
+            ctypes.CDLL(found)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def probe_cuda_runtime() -> Tuple[bool, str]:
+    """Check whether both an NVIDIA GPU and the required CUDA cuBLAS runtime libraries are usable."""
+    try:
+        count = int(ctranslate2.get_cuda_device_count())
+    except Exception as exc:
+        return False, f"CTranslate2 CUDA device query failed ({exc}); using CPU int8."
+
+    if count <= 0:
+        return False, "No CUDA GPU reported by CTranslate2; using CPU int8."
+
+    if not _can_load_cublas_runtime():
+        return (
+            False,
+            "NVIDIA GPU detected by driver, but CUDA cuBLAS runtime libraries (cublas64_12.dll / libcublas.so) "
+            "are not available; falling back safely to CPU int8.",
+        )
+
+    return True, f"CUDA GPU and cuBLAS runtime verified ({count} device(s))."
+
+
+def is_cuda_available() -> bool:
+    """Safely check whether both a CUDA GPU and its required cuBLAS runtime are usable."""
+    usable, _reason = probe_cuda_runtime()
+    return usable
+
+
+def select_whisper_model_and_device(
+    config: EditingConfig,
+    *,
+    system_ram_gb: Optional[float] = None,
+    cpu_cores: Optional[int] = None,
+    cuda_available: Optional[bool] = None,
+    gpu_vram_gb: Optional[float] = None,
+) -> WhisperRuntimeSelection:
+    """Select between Whisper 'base' and 'small' and CPU/CUDA with safe CPU fallback.
+
+    Specifically tuned so 8 GB RAM / 4 GB VRAM laptops (e.g. Ryzen 5 7535HS + RTX 2050)
+    default to the lightweight 'base' model and quantized int8 compute type to avoid
+    RAM or VRAM exhaustion.
+    """
+    ram_gb = system_ram_gb if system_ram_gb is not None else get_system_ram_gb()
+    cores = cpu_cores if cpu_cores is not None else (os.cpu_count() or 4)
+    if cuda_available is not None:
+        cuda_ok = cuda_available
+        cuda_note = "CUDA status supplied by caller."
+    else:
+        cuda_ok, cuda_note = probe_cuda_runtime()
+
+    vram_gb = gpu_vram_gb if gpu_vram_gb is not None else (get_gpu_vram_gb() if cuda_ok else None)
+
+    # Determine execution device and memory-safe compute_type
+    # Note: On constrained laptops (< 12 GB system RAM or <= 4 GB VRAM like RTX 2050),
+    # use int8 quantization even on CUDA to minimize VRAM and host RAM footprint.
+    is_memory_constrained = (ram_gb < 12.0) or (vram_gb is not None and vram_gb < 6.0)
 
     if config.whisper_device == "cuda":
         if cuda_ok:
             device = "cuda"
-            compute_type = config.whisper_compute_type if config.whisper_compute_type != "int8" else "float16"
+            if config.whisper_compute_type != "int8":
+                compute_type = config.whisper_compute_type
+            else:
+                compute_type = "int8" if is_memory_constrained else "float16"
         else:
             device = "cpu"
             compute_type = "int8"
@@ -93,27 +184,43 @@ def select_whisper_model_and_device(config: EditingConfig) -> WhisperRuntimeSele
         compute_type = "int8"
     else:
         device = "cuda" if cuda_ok else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+        if device == "cuda":
+            compute_type = "int8" if is_memory_constrained else "float16"
+        else:
+            compute_type = "int8"
 
     if config.whisper_model != "auto":
         model_name = config.whisper_model
+        vram_str = f", VRAM={vram_gb:.1f} GB" if vram_gb is not None else ""
         rationale = (
             f"Explicitly configured model '{model_name}' on device='{device}' "
-            f"(compute_type='{compute_type}', RAM={ram_gb:.1f} GB, cores={cores}, cuda={cuda_ok})."
+            f"(compute_type='{compute_type}', RAM={ram_gb:.1f} GB{vram_str}, cores={cores}, cuda={cuda_ok}; {cuda_note})"
         )
     else:
-        # Automatic selection between 'base' and 'small' based on hardware resources
-        if device == "cuda" or (ram_gb >= 12.0 and cores >= 8):
+        # Automatic selection between 'base' and 'small':
+        # Only choose 'small' when system RAM >= 12 GB AND either:
+        #   - CUDA is usable with >= 6 GB VRAM, OR
+        #   - System RAM >= 16 GB and CPU cores >= 8.
+        # On 8 GB RAM / 4 GB VRAM laptops (e.g., Ryzen 5 7535HS + RTX 2050), always choose 'base'.
+        high_tier_cuda = (
+            device == "cuda"
+            and ram_gb >= 12.0
+            and (vram_gb is None or vram_gb >= 6.0)
+        )
+        high_tier_cpu = ram_gb >= 16.0 and cores >= 8
+
+        vram_str = f", VRAM={vram_gb:.1f} GB" if vram_gb is not None else ""
+        if high_tier_cuda or high_tier_cpu:
             model_name = "small"
             rationale = (
-                f"Auto-selected Whisper 'small' because hardware meets higher-tier threshold "
-                f"(device='{device}', RAM={ram_gb:.1f} GB, cores={cores})."
+                f"Auto-selected Whisper 'small' because hardware meets high-headroom threshold "
+                f"(device='{device}', compute_type='{compute_type}', RAM={ram_gb:.1f} GB{vram_str}, cores={cores})."
             )
         else:
             model_name = "base"
             rationale = (
-                f"Auto-selected Whisper 'base' for responsive CPU execution on constrained hardware "
-                f"(device='{device}', RAM={ram_gb:.1f} GB, cores={cores})."
+                f"Auto-selected Whisper 'base' ({compute_type}) for safe, low-memory execution "
+                f"(device='{device}', RAM={ram_gb:.1f} GB{vram_str}, cores={cores}; {cuda_note})"
             )
 
     return WhisperRuntimeSelection(
@@ -124,6 +231,7 @@ def select_whisper_model_and_device(config: EditingConfig) -> WhisperRuntimeSele
         cpu_cores=cores,
         cuda_available=cuda_ok,
         rationale=rationale,
+        gpu_vram_gb=vram_gb,
     )
 
 
@@ -166,15 +274,59 @@ def detect_stumble_in_segment(
 TranscriberCallable = Callable[[np.ndarray, EditingConfig, WhisperRuntimeSelection], List[TranscriptSegment]]
 
 
+def _parse_faster_whisper_segments(raw_segments: object) -> List[TranscriptSegment]:
+    """Consume faster-whisper generator and convert into typed TranscriptSegment list."""
+    results: List[TranscriptSegment] = []
+    for idx, seg in enumerate(raw_segments):  # type: ignore[arg-type]
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        words_list: List[TranscriptWord] = []
+        if getattr(seg, "words", None):
+            for w in seg.words:
+                words_list.append(
+                    TranscriptWord(
+                        word=str(w.word),
+                        start=round(float(w.start), 4),
+                        end=round(float(w.end), 4),
+                        probability=round(float(getattr(w, "probability", 0.85)), 4),
+                    )
+                )
+
+        avg_logprob = float(getattr(seg, "avg_logprob", -0.35))
+        no_speech_prob = float(getattr(seg, "no_speech_prob", 0.05))
+        if words_list:
+            word_prob = sum(w.probability for w in words_list) / float(len(words_list))
+        else:
+            word_prob = math.exp(max(-3.0, min(0.0, avg_logprob)))
+        seg_conf = round(min(1.0, max(0.05, word_prob * (1.0 - 0.5 * no_speech_prob))), 4)
+
+        is_stumble, stumble_conf = detect_stumble_in_segment(text, words_list, seg_conf)
+        results.append(
+            TranscriptSegment(
+                segment_id=idx,
+                start=round(float(seg.start), 4),
+                end=round(float(seg.end), 4),
+                text=text,
+                confidence=seg_conf,
+                words=words_list,
+                is_stumble_candidate=is_stumble,
+                stumble_confidence=stumble_conf,
+            )
+        )
+    return results
+
+
 def transcribe_audio_stream(
     samples_16k: np.ndarray,
     config: EditingConfig,
     custom_transcriber: Optional[TranscriberCallable] = None,
 ) -> Tuple[List[TranscriptSegment], WhisperRuntimeSelection, str, List[str]]:
-    """Transcribe a 16 kHz mono float32 audio stream using faster-whisper with CPU fallback.
+    """Transcribe a 16 kHz mono float32 audio stream using faster-whisper with full runtime CPU fallback.
 
-    Returns:
-      (segments, runtime_selection, status_string, warnings_list)
+    Note: CTranslate2 loads cuBLAS and allocates VRAM lazily during model.transcribe() iteration.
+    Therefore, both WhisperModel() initialization AND segment consumption are protected by the
+    CUDA -> CPU int8 fallback handler.
     """
     selection = select_whisper_model_and_device(config)
     warnings: List[str] = []
@@ -188,56 +340,17 @@ def transcribe_audio_stream(
 
     from faster_whisper import WhisperModel
 
-    model: Optional[WhisperModel] = None
-    active_selection = selection
-
-    try:
+    def _run_attempt(sel: WhisperRuntimeSelection) -> List[TranscriptSegment]:
         model = WhisperModel(
-            selection.model_name,
-            device=selection.device,
-            compute_type=selection.compute_type,
+            sel.model_name,
+            device=sel.device,
+            compute_type=sel.compute_type,
+            cpu_threads=min(4, max(1, sel.cpu_cores)),
         )
-    except Exception as first_err:
-        if selection.device == "cuda":
-            warnings.append(
-                f"CUDA initialization failed for Whisper '{selection.model_name}' ({first_err}); "
-                "falling back automatically to CPU (int8)."
-            )
-            active_selection = WhisperRuntimeSelection(
-                model_name=selection.model_name,
-                device="cpu",
-                compute_type="int8",
-                system_ram_gb=selection.system_ram_gb,
-                cpu_cores=selection.cpu_cores,
-                cuda_available=False,
-                rationale=selection.rationale + " (CPU fallback after CUDA error)",
-            )
-            try:
-                model = WhisperModel(
-                    active_selection.model_name,
-                    device="cpu",
-                    compute_type="int8",
-                )
-            except Exception as cpu_err:
-                warnings.append(
-                    f"Whisper model '{active_selection.model_name}' could not be loaded locally ({cpu_err}). "
-                    "Continuing with Silero VAD speech intervals only; run scripts/install.ps1 with internet "
-                    "access to cache the faster-whisper model locally for full subtitle and stumble analysis."
-                )
-                return [], active_selection, "skipped_model_unavailable", warnings
-        else:
-            warnings.append(
-                f"Whisper model '{selection.model_name}' could not be loaded locally ({first_err}). "
-                "Continuing with Silero VAD speech intervals only; run scripts/install.ps1 with internet "
-                "access to cache the faster-whisper model locally for full subtitle and stumble analysis."
-            )
-            return [], active_selection, "skipped_model_unavailable", warnings
-
-    try:
         raw_segments, _info = model.transcribe(
             samples_16k,
             language=config.language,
-            beam_size=3,
+            beam_size=2 if sel.system_ram_gb < 12.0 else 3,
             word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(
@@ -247,46 +360,58 @@ def transcribe_audio_stream(
                 speech_pad_ms=150,
             ),
         )
+        return _parse_faster_whisper_segments(raw_segments)
 
-        results: List[TranscriptSegment] = []
-        for idx, seg in enumerate(raw_segments):
-            text = (seg.text or "").strip()
-            if not text:
-                continue
-            words_list: List[TranscriptWord] = []
-            if seg.words:
-                for w in seg.words:
-                    words_list.append(
-                        TranscriptWord(
-                            word=str(w.word),
-                            start=round(float(w.start), 4),
-                            end=round(float(w.end), 4),
-                            probability=round(float(getattr(w, "probability", 0.85)), 4),
-                        )
-                    )
-
-            avg_logprob = float(getattr(seg, "avg_logprob", -0.35))
-            no_speech_prob = float(getattr(seg, "no_speech_prob", 0.05))
-            if words_list:
-                word_prob = sum(w.probability for w in words_list) / float(len(words_list))
-            else:
-                word_prob = math.exp(max(-3.0, min(0.0, avg_logprob)))
-            seg_conf = round(min(1.0, max(0.05, word_prob * (1.0 - 0.5 * no_speech_prob))), 4)
-
-            is_stumble, stumble_conf = detect_stumble_in_segment(text, words_list, seg_conf)
-            results.append(
-                TranscriptSegment(
-                    segment_id=idx,
-                    start=round(float(seg.start), 4),
-                    end=round(float(seg.end), 4),
-                    text=text,
-                    confidence=seg_conf,
-                    words=words_list,
-                    is_stumble_candidate=is_stumble,
-                    stumble_confidence=stumble_conf,
-                )
+    active_selection = selection
+    try:
+        segments = _run_attempt(active_selection)
+        return segments, active_selection, "completed", warnings
+    except MemoryError as mem_err:
+        warnings.append(
+            f"Insufficient memory while running Whisper '{active_selection.model_name}' on {active_selection.device} ({mem_err}). "
+            "Falling back to Silero VAD speech intervals; close heavy background applications or use '--whisper-model base --whisper-device cpu'."
+        )
+        return [], active_selection, "failed_out_of_memory", warnings
+    except Exception as first_err:
+        err_text = str(first_err)
+        if active_selection.device == "cuda":
+            fallback_model = (
+                "base"
+                if (config.whisper_model == "auto" and "memory" in err_text.lower())
+                else active_selection.model_name
             )
-        return results, active_selection, "completed", warnings
-    except Exception as exc:
-        warnings.append(f"Transcription runtime failed ({exc}); falling back to VAD intervals.")
-        return [], active_selection, "failed_fallback_to_vad", warnings
+            warnings.append(
+                f"CUDA execution failed for Whisper '{active_selection.model_name}' ({first_err}); "
+                f"falling back automatically to CPU (int8) with model '{fallback_model}'."
+            )
+            active_selection = WhisperRuntimeSelection(
+                model_name=fallback_model,
+                device="cpu",
+                compute_type="int8",
+                system_ram_gb=selection.system_ram_gb,
+                cpu_cores=selection.cpu_cores,
+                cuda_available=False,
+                rationale=selection.rationale + " (Automatic CPU int8 fallback after CUDA error)",
+                gpu_vram_gb=selection.gpu_vram_gb,
+            )
+            try:
+                segments = _run_attempt(active_selection)
+                return segments, active_selection, "completed_cpu_fallback", warnings
+            except Exception as cpu_err:
+                first_err = cpu_err
+                err_text = str(cpu_err)
+
+        if any(k in err_text.lower() for k in ("memory", "alloc", "bad_alloc", "out of memory")):
+            warnings.append(
+                f"Insufficient RAM/VRAM while loading or running Whisper '{active_selection.model_name}' ({first_err}). "
+                "Continuing with Silero VAD speech intervals only; use '--whisper-model base --whisper-device cpu' to reduce memory usage."
+            )
+            return [], active_selection, "failed_out_of_memory", warnings
+
+        warnings.append(
+            f"Whisper model '{active_selection.model_name}' could not be loaded or downloaded ({first_err}). "
+            "Continuing with local Silero VAD speech intervals only; connect to the internet and run "
+            "'powershell -ExecutionPolicy Bypass -File .\\scripts\\install.ps1 -PreDownloadWhisperModel base' "
+            "to cache the model locally for offline subtitle and stumble analysis."
+        )
+        return [], active_selection, "skipped_model_unavailable", warnings

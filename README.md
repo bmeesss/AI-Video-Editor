@@ -77,11 +77,11 @@ OpenCode automatically discovers the repository skills in `.opencode/skills/`:
 
 | Whisper Model | Disk Download Size | Approx. RAM / VRAM (`int8` / `fp16`) | Auto-Selection Rule (`--whisper-model auto`) |
 | :--- | :--- | :--- | :--- |
-| **`base`** | ~145 MB | ~0.8 – 1.2 GB RAM | Selected on CPU-only machines with `< 12 GB` RAM or `< 8` CPU cores. |
-| **`small`** | ~480 MB | ~1.8 – 2.4 GB RAM | Selected when a CUDA GPU is available OR when system RAM `>= 12 GB` and CPU cores `>= 8`. |
+| **`base`** | ~145 MB | ~0.8 – 1.2 GB RAM (or VRAM in `int8`) | Default on laptops/PCs with `< 12 GB` RAM or `< 6 GB` VRAM (e.g., Ryzen 5 7535HS + RTX 2050 4 GB VRAM + 8 GB RAM), using `int8` quantization to prevent memory pressure. |
+| **`small`** | ~480 MB | ~1.8 – 2.4 GB RAM / VRAM | Selected only when system RAM `>= 12 GB` AND (`CUDA VRAM >= 6 GB` OR `RAM >= 16 GB` with `>= 8` CPU cores). |
 | **Silero VAD v6** | ~2 MB (bundled in `faster-whisper`) | < 100 MB RAM (`onnxruntime`) | Always enabled for millisecond voice activity detection. |
 
-You can override model selection explicitly at any time with `--whisper-model base`, `--whisper-model small`, or `--whisper-device cpu`.
+You can override model selection explicitly at any time with `--whisper-model base`, `--whisper-model small`, `--whisper-model C:\Path\To\LocalModelDir`, or `--whisper-device cpu`. Additional CLI tuning flags include `--preserve-intro`, `--min-silence`, `--speech-pre-roll`, `--speech-post-roll`, `--min-kept-clip`, `--min-confidence`, `--no-remove-stumbles`, `--disable-visual-analysis`, and `--no-subtitles`.
 
 ---
 

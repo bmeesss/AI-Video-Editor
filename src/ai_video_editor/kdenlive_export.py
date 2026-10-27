@@ -323,7 +323,7 @@ def render_kdenlive_xml(
 
     # 4. Per-track <chain>, <playlist>, and <tractor> elements
     default_audio_stream = (
-        media.primary_mic_stream.stream_index if media.primary_mic_stream is not None else 1
+        media.primary_mic_stream.stream_index if media.primary_mic_stream is not None else -1
     )
     filter_counter = 0
 
@@ -613,40 +613,42 @@ def export_kdenlive_project(
         )
 
     snap = capture_source_snapshot(edm.source_media.path)
-    out_dir = Path(output_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir = Path(output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    kdenlive_filename = (
-        project_basename
-        if project_basename.endswith(".kdenlive")
-        else f"{project_basename}.kdenlive"
-    )
-    kdenlive_path = out_dir / kdenlive_filename
-
-    kdenlive_srt_path: Optional[Path] = None
-    standalone_srt_path: Optional[Path] = None
-    subtitle_sidecar_name: Optional[str] = None
-
-    if edm.subtitles:
-        subtitle_sidecar_name = f"{kdenlive_filename}.srt"
-        kdenlive_srt_path = write_srt_sidecar(
-            out_dir / subtitle_sidecar_name,
-            edm.subtitles,
-            source_media_path=edm.source_media.path,
+        kdenlive_filename = (
+            project_basename
+            if project_basename.endswith(".kdenlive")
+            else f"{project_basename}.kdenlive"
         )
-        stem = kdenlive_filename[: -len(".kdenlive")]
-        standalone_srt_path = write_srt_sidecar(
-            out_dir / f"{stem}.srt",
-            edm.subtitles,
-            source_media_path=edm.source_media.path,
-        )
+        kdenlive_path = out_dir / kdenlive_filename
 
-    xml_content = render_kdenlive_xml(
-        edm=edm,
-        project_dir=out_dir,
-        subtitle_filename=subtitle_sidecar_name,
-    )
-    safe_write_text(kdenlive_path, xml_content, source_path=edm.source_media.path)
-    verify_source_untouched(snap)
+        kdenlive_srt_path: Optional[Path] = None
+        standalone_srt_path: Optional[Path] = None
+        subtitle_sidecar_name: Optional[str] = None
+
+        if edm.subtitles:
+            subtitle_sidecar_name = f"{kdenlive_filename}.srt"
+            kdenlive_srt_path = write_srt_sidecar(
+                out_dir / subtitle_sidecar_name,
+                edm.subtitles,
+                source_media_path=edm.source_media.path,
+            )
+            stem = kdenlive_filename[: -len(".kdenlive")]
+            standalone_srt_path = write_srt_sidecar(
+                out_dir / f"{stem}.srt",
+                edm.subtitles,
+                source_media_path=edm.source_media.path,
+            )
+
+        xml_content = render_kdenlive_xml(
+            edm=edm,
+            project_dir=out_dir,
+            subtitle_filename=subtitle_sidecar_name,
+        )
+        safe_write_text(kdenlive_path, xml_content, source_path=edm.source_media.path)
+    finally:
+        verify_source_untouched(snap)
 
     return kdenlive_path, kdenlive_srt_path, standalone_srt_path

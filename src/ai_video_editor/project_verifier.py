@@ -163,6 +163,7 @@ def verify_srt_file(srt_path: Path) -> Tuple[bool, List[str], int]:
         r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})$"
     )
     prev_start_ms = -1
+    prev_end_ms = -1
 
     for idx, block in enumerate(blocks, start=1):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
@@ -182,7 +183,12 @@ def verify_srt_file(srt_path: Path) -> Tuple[bool, List[str], int]:
             errors.append(f"SRT block #{idx} end timestamp <= start timestamp ({lines[1]}).")
         if start_ms < prev_start_ms:
             errors.append(f"SRT block #{idx} is not in chronological order.")
+        if start_ms < prev_end_ms:
+            errors.append(
+                f"SRT block #{idx} overlaps previous subtitle cue (start={start_ms}ms < prev_end={prev_end_ms}ms)."
+            )
         prev_start_ms = start_ms
+        prev_end_ms = end_ms
 
     return len(errors) == 0, errors, len(blocks)
 
@@ -390,6 +396,11 @@ def verify_kdenlive_project(
         for child in pl_main:
             if child.tag == "blank":
                 gap_f = mlt_timecode_to_frame(child.attrib["length"], fps_num, fps_den)
+                if not is_review_hidden:
+                    errors.append(
+                        f"Active non-review track playlist '{pl_main_id}' contains a <blank> gap of {gap_f} frame(s); "
+                        "active tracks must be ripple-packed without gaps."
+                    )
                 cursor_f += gap_f
             elif child.tag == "entry":
                 c_id = child.attrib.get("producer", "")

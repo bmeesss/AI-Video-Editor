@@ -124,18 +124,23 @@ def sanitize_filename_slug(title: str, max_length: int = 48) -> str:
         cleaned = "gaming_project"
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length].rstrip("._ ")
-    if not cleaned or cleaned.upper() in WINDOWS_RESERVED_NAMES:
+    stem_before_dot = cleaned.split(".")[0].upper() if cleaned else ""
+    if (
+        not cleaned
+        or cleaned.upper() in WINDOWS_RESERVED_NAMES
+        or stem_before_dot in WINDOWS_RESERVED_NAMES
+    ):
         cleaned = f"project_{cleaned}" if cleaned else "gaming_project"
     return cleaned
 
 
 def assert_not_source_path(target_path: Path, source_path: Path) -> None:
-    """Ensure target_path never resolves to source_path."""
+    """Ensure target_path never resolves to source_path or inside source_path."""
     resolved_target = target_path.expanduser().resolve()
     resolved_source = source_path.expanduser().resolve()
-    if resolved_target == resolved_source:
+    if resolved_target == resolved_source or resolved_source in resolved_target.parents:
         raise SafetyViolationError(
-            f"Refusing to write to source media path: {resolved_target}"
+            f"Refusing to write to source media path (or inside it): {resolved_target}"
         )
 
 
@@ -151,15 +156,12 @@ def create_unique_job_directory(
     """
     base = Path(base_output_dir).expanduser().resolve()
     if source_path is not None:
-        src_resolved = Path(source_path).expanduser().resolve()
-        if base == src_resolved:
+        assert_not_source_path(base, Path(source_path))
+    for candidate_dir in (base, *base.parents):
+        if candidate_dir.exists() and not candidate_dir.is_dir():
             raise SafetyViolationError(
-                f"Base output directory cannot be the source media file: {base}"
+                f"Output path or ancestor exists and is not a directory: {candidate_dir}"
             )
-    if base.exists() and not base.is_dir():
-        raise SafetyViolationError(
-            f"Base output path exists and is not a directory: {base}"
-        )
     base.mkdir(parents=True, exist_ok=True)
 
     slug = sanitize_filename_slug(title)

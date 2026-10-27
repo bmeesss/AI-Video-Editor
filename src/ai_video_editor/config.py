@@ -68,14 +68,13 @@ class EditingConfig:
             raise ConfigValidationError(
                 f"Invalid timeline_mode '{self.timeline_mode}'. Must be one of {VALID_TIMELINE_MODES}."
             )
-        if (
-            self.whisper_model not in VALID_WHISPER_MODELS
-            and not Path(self.whisper_model).exists()
-        ):
-            raise ConfigValidationError(
-                f"Invalid whisper_model '{self.whisper_model}'. "
-                f"Allowed values in v1: {VALID_WHISPER_MODELS} or an existing local model directory."
-            )
+        if self.whisper_model not in VALID_WHISPER_MODELS:
+            model_path = Path(self.whisper_model).expanduser()
+            if not model_path.exists() or not model_path.is_dir() or not (model_path / "model.bin").is_file():
+                raise ConfigValidationError(
+                    f"Invalid whisper_model '{self.whisper_model}'. "
+                    f"Allowed values in v1: {VALID_WHISPER_MODELS} or an existing local CTranslate2 Whisper model directory containing 'model.bin'."
+                )
         if self.whisper_device not in ("auto", "cpu", "cuda"):
             raise ConfigValidationError(
                 f"Invalid whisper_device '{self.whisper_device}'. Must be 'auto', 'cpu', or 'cuda'."

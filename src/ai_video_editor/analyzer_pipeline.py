@@ -71,81 +71,84 @@ def analyze_recording(
     cfg = config or EditingConfig()
     initial_snap = capture_source_snapshot(source_path)
 
-    media_info = probe_media(source_path)
-    warnings: List[str] = list(media_info.warnings)
-    notes: List[str] = [
-        "Source media inspected in strictly read-only mode; SHA-256 and MD5 hashes verified before and after analysis.",
-        "Visual motion and audio loudness transients are treated solely as contextual signals to avoid cutting active gameplay or reactions, never as ground-truth labels of 'funny' or 'exciting' moments.",
-    ]
+    try:
+        media_info = probe_media(source_path)
+        warnings: List[str] = list(media_info.warnings)
+        notes: List[str] = [
+            "Source media inspected in strictly read-only mode; SHA-256 and MD5 hashes verified before and after analysis.",
+            "Visual motion and audio loudness transients are treated solely as contextual signals to avoid cutting active gameplay or reactions, never as ground-truth labels of 'funny' or 'exciting' moments.",
+        ]
 
-    speech_intervals: List[SpeechInterval] = []
-    transcript_segments: List[TranscriptSegment] = []
-    audio_energy_windows: List[AudioEnergyWindow] = []
-    whisper_model_used = "none"
-    whisper_device_used = "cpu"
-    transcription_status = "no_audio"
+        speech_intervals: List[SpeechInterval] = []
+        transcript_segments: List[TranscriptSegment] = []
+        audio_energy_windows: List[AudioEnergyWindow] = []
+        whisper_model_used = "none"
+        whisper_device_used = "cpu"
+        transcription_status = "no_audio"
 
-    primary_mic = media_info.primary_mic_stream
-    if primary_mic is not None:
-        notes.append(
-            f"Selected audio stream {primary_mic.stream_index} (role='{primary_mic.inferred_role}', "
-            f"title='{primary_mic.title or 'untitled'}') as primary commentary/speech analysis stream."
-        )
-        mic_samples = extract_audio_pcm_16k_mono(source_path, primary_mic.stream_index)
-        vad_intervals = detect_voice_activity(mic_samples, primary_mic.stream_index, cfg)
-        mic_energy = analyze_audio_energy_windows(mic_samples, primary_mic.stream_index, cfg)
-        audio_energy_windows.extend(mic_energy)
-
-        transcript_segments, selection, transcription_status, trans_warnings = transcribe_audio_stream(
-            mic_samples,
-            cfg,
-            custom_transcriber=custom_transcriber,
-        )
-        whisper_model_used = selection.model_name
-        whisper_device_used = selection.device
-        notes.append(selection.rationale)
-        warnings.extend(trans_warnings)
-
-        speech_intervals = _merge_transcript_into_speech_intervals(
-            vad_intervals,
-            transcript_segments,
-            primary_mic.stream_index,
-        )
-
-        # Also analyze secondary/gameplay audio streams for loudness transients so loud game events aren't ignored
-        for astream in media_info.audio_streams:
-            if astream.stream_index == primary_mic.stream_index:
-                continue
+        primary_mic = media_info.primary_mic_stream
+        if primary_mic is not None:
             notes.append(
-                f"Analyzed secondary audio stream {astream.stream_index} (role='{astream.inferred_role}', "
-                f"title='{astream.title or 'untitled'}') for gameplay audio energy and transients."
+                f"Selected audio stream {primary_mic.stream_index} (role='{primary_mic.inferred_role}', "
+                f"title='{primary_mic.title or 'untitled'}') as primary commentary/speech analysis stream."
             )
-            sec_samples = extract_audio_pcm_16k_mono(source_path, astream.stream_index)
-            sec_energy = analyze_audio_energy_windows(sec_samples, astream.stream_index, cfg)
-            audio_energy_windows.extend(sec_energy)
+            mic_samples = extract_audio_pcm_16k_mono(source_path, primary_mic.stream_index)
+            vad_intervals = detect_voice_activity(mic_samples, primary_mic.stream_index, cfg)
+            mic_energy = analyze_audio_energy_windows(mic_samples, primary_mic.stream_index, cfg)
+            audio_energy_windows.extend(mic_energy)
 
-    scenes, motion_windows = analyze_visual_scenes_and_motion(source_path, media_info, cfg)
+            transcript_segments, selection, transcription_status, trans_warnings = transcribe_audio_stream(
+                mic_samples,
+                cfg,
+                custom_transcriber=custom_transcriber,
+            )
+            whisper_model_used = selection.model_name
+            whisper_device_used = selection.device
+            notes.append(selection.rationale)
+            warnings.extend(trans_warnings)
 
-    # Compute overall analysis confidence
-    conf_components: List[float] = []
-    if media_info.video_streams:
-        conf_components.append(0.90 if not media_info.video_streams[0].is_vfr else 0.70)
-    if speech_intervals:
-        mean_vad_conf = sum(s.confidence for s in speech_intervals) / float(len(speech_intervals))
-        conf_components.append(mean_vad_conf)
-    if transcript_segments:
-        mean_tx_conf = sum(t.confidence for t in transcript_segments) / float(len(transcript_segments))
-        conf_components.append(mean_tx_conf)
-    elif transcription_status.startswith("skipped"):
-        # Lower confidence slightly when Whisper model weights were unavailable offline
-        conf_components.append(0.68)
+            speech_intervals = _merge_transcript_into_speech_intervals(
+                vad_intervals,
+                transcript_segments,
+                primary_mic.stream_index,
+            )
 
-    overall_conf = round(
-        sum(conf_components) / float(len(conf_components)) if conf_components else 0.50,
-        4,
-    )
+            # Also analyze secondary/gameplay audio streams for loudness transients so loud game events aren't ignored
+            for astream in media_info.audio_streams:
+                if astream.stream_index == primary_mic.stream_index:
+                    continue
+                notes.append(
+                    f"Analyzed secondary audio stream {astream.stream_index} (role='{astream.inferred_role}', "
+                    f"title='{astream.title or 'untitled'}') for gameplay audio energy and transients."
+                )
+                sec_samples = extract_audio_pcm_16k_mono(source_path, astream.stream_index)
+                sec_energy = analyze_audio_energy_windows(sec_samples, astream.stream_index, cfg)
+                audio_energy_windows.extend(sec_energy)
 
-    verify_source_untouched(initial_snap)
+        scenes, motion_windows = analyze_visual_scenes_and_motion(source_path, media_info, cfg)
+
+        # Compute overall analysis confidence
+        conf_components: List[float] = []
+        if media_info.video_streams:
+            conf_components.append(0.90 if not media_info.video_streams[0].is_vfr else 0.70)
+        else:
+            conf_components.append(0.25)
+        if speech_intervals:
+            mean_vad_conf = sum(s.confidence for s in speech_intervals) / float(len(speech_intervals))
+            conf_components.append(mean_vad_conf)
+        if transcript_segments:
+            mean_tx_conf = sum(t.confidence for t in transcript_segments) / float(len(transcript_segments))
+            conf_components.append(mean_tx_conf)
+        elif transcription_status.startswith("skipped") or transcription_status.startswith("failed"):
+            # Lower confidence slightly when Whisper model weights were unavailable offline
+            conf_components.append(0.68)
+
+        overall_conf = round(
+            sum(conf_components) / float(len(conf_components)) if conf_components else 0.50,
+            4,
+        )
+    finally:
+        verify_source_untouched(initial_snap)
 
     return AnalysisReport(
         schema_version="1.0.0",

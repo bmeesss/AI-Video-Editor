@@ -16,6 +16,8 @@ from .models import AnalysisReport
 from .planner import build_edit_decision_model
 from .project_verifier import verify_kdenlive_project
 from .safety import (
+    SafetyViolationError,
+    assert_not_source_path,
     capture_source_snapshot,
     create_unique_job_directory,
     safe_write_text,
@@ -72,10 +74,26 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
         help="Safety margin in seconds preserved after each speech segment (default: 0.45).",
     )
     parser.add_argument(
+        "--min-kept-clip",
+        type=float,
+        default=1.2,
+        help="Minimum duration in seconds of a kept clip to avoid micro-cuts (default: 1.2).",
+    )
+    parser.add_argument(
         "--min-confidence",
         type=float,
         default=0.55,
         help="Minimum required overall edit confidence [0.0-1.0]; halts for human review if below threshold (default: 0.55).",
+    )
+    parser.add_argument(
+        "--no-remove-stumbles",
+        action="store_true",
+        help="Disable automatic removal of obvious hesitation/filler stumbles.",
+    )
+    parser.add_argument(
+        "--disable-visual-analysis",
+        action="store_true",
+        help="Disable scene cut and visual gameplay motion analysis.",
     )
     parser.add_argument(
         "--no-subtitles",
@@ -94,9 +112,63 @@ def _config_from_args(args: argparse.Namespace) -> EditingConfig:
         min_silence_duration_seconds=getattr(args, "min_silence", 2.5),
         speech_pre_roll_seconds=getattr(args, "speech_pre_roll", 0.35),
         speech_post_roll_seconds=getattr(args, "speech_post_roll", 0.45),
+        min_kept_clip_duration_seconds=getattr(args, "min_kept_clip", 1.2),
         min_overall_edit_confidence=getattr(args, "min_confidence", 0.55),
+        remove_obvious_stumbles=not getattr(args, "no_remove_stumbles", False),
+        enable_visual_analysis=not getattr(args, "disable_visual_analysis", False),
         generate_subtitles=not getattr(args, "no_subtitles", False),
     )
+
+
+def _resolve_analyze_report_path(
+    output_report_arg: Optional[str],
+    source_path: Path,
+) -> Path:
+    """Resolve and validate the target path for analysis_report.json BEFORE running analysis.
+
+    - If output_report_arg is omitted or does not end with '.json' (or is an existing directory),
+      allocates a collision-free job directory under that base path and returns <job_dir>/analysis_report.json.
+    - If output_report_arg ends with '.json' (and is not an existing directory), verifies upfront that
+      the file does not already exist and is not the source file.
+    """
+    if not output_report_arg:
+        job_dir = create_unique_job_directory(
+            Path.cwd() / "output",
+            source_path.stem,
+            source_path=source_path,
+        )
+        return job_dir / "analysis_report.json"
+
+    out_target = Path(output_report_arg).expanduser().resolve()
+    assert_not_source_path(out_target, source_path)
+
+    if out_target.exists() and out_target.is_dir():
+        job_dir = create_unique_job_directory(
+            out_target,
+            source_path.stem,
+            source_path=source_path,
+        )
+        return job_dir / "analysis_report.json"
+
+    if out_target.suffix.lower() == ".json":
+        if out_target.exists():
+            raise SafetyViolationError(
+                f"Refusing to overwrite existing analysis report file: {out_target}"
+            )
+        for parent in out_target.parents:
+            if parent.exists() and not parent.is_dir():
+                raise SafetyViolationError(
+                    f"Parent path exists and is not a directory: {parent}"
+                )
+        return out_target
+
+    # Otherwise, treat out_target as a base output directory (even if it does not exist yet)
+    job_dir = create_unique_job_directory(
+        out_target,
+        source_path.stem,
+        source_path=source_path,
+    )
+    return job_dir / "analysis_report.json"
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
@@ -104,21 +176,12 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     cfg = _config_from_args(args)
     snap = capture_source_snapshot(source_path)
 
-    report = analyze_recording(source_path, config=cfg)
-
-    if args.output_report:
-        out_target = Path(args.output_report).expanduser().resolve()
-        if out_target.exists() and out_target.is_dir():
-            job_dir = create_unique_job_directory(out_target, source_path.stem, source_path=source_path)
-            report_path = job_dir / "analysis_report.json"
-        else:
-            report_path = out_target
-    else:
-        job_dir = create_unique_job_directory(Path.cwd() / "output", source_path.stem, source_path=source_path)
-        report_path = job_dir / "analysis_report.json"
-
-    safe_write_text(report_path, report.to_json(indent=2), source_path=source_path)
-    verify_source_untouched(snap)
+    try:
+        report_path = _resolve_analyze_report_path(args.output_report, source_path)
+        report = analyze_recording(source_path, config=cfg)
+        safe_write_text(report_path, report.to_json(indent=2), source_path=source_path)
+    finally:
+        verify_source_untouched(snap)
 
     summary = {
         "status": "ok",
@@ -150,45 +213,46 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     snap = capture_source_snapshot(source_path)
     cfg = _config_from_args(args)
 
-    job_dir = create_unique_job_directory(
-        args.output_dir,
-        args.title,
-        source_path=source_path,
-    )
-    edm = build_edit_decision_model(report, title=args.title, config=cfg)
-    edm_path = safe_write_text(
-        job_dir / "edit_decisions.json",
-        edm.to_json(indent=2),
-        source_path=source_path,
-    )
+    try:
+        job_dir = create_unique_job_directory(
+            args.output_dir,
+            args.title,
+            source_path=source_path,
+        )
+        edm = build_edit_decision_model(report, title=args.title, config=cfg)
+        edm_path = safe_write_text(
+            job_dir / "edit_decisions.json",
+            edm.to_json(indent=2),
+            source_path=source_path,
+        )
 
-    if edm.low_confidence_halt:
+        if edm.low_confidence_halt:
+            halt_payload = {
+                "status": "halted_low_confidence",
+                "reason": "Edit confidence is below configured minimum; human review required.",
+                "overall_confidence": edm.overall_confidence,
+                "min_required_confidence": cfg.min_overall_edit_confidence,
+                "job_dir": str(job_dir),
+                "edit_decisions_path": str(edm_path),
+                "warnings": edm.warnings,
+            }
+            print(json.dumps(halt_payload, indent=2, ensure_ascii=False))
+            return 2
+
+        slug = sanitize_filename_slug(args.title)
+        kdenlive_path, kdenlive_srt, standalone_srt = export_kdenlive_project(
+            edm=edm,
+            output_dir=job_dir,
+            project_basename=slug,
+        )
+        verification = verify_kdenlive_project(kdenlive_path, check_source_media_exists=True)
+        ver_path = safe_write_text(
+            job_dir / "verification_report.json",
+            verification.to_json(indent=2),
+            source_path=source_path,
+        )
+    finally:
         verify_source_untouched(snap)
-        halt_payload = {
-            "status": "halted_low_confidence",
-            "reason": "Edit confidence is below configured minimum; human review required.",
-            "overall_confidence": edm.overall_confidence,
-            "min_required_confidence": cfg.min_overall_edit_confidence,
-            "job_dir": str(job_dir),
-            "edit_decisions_path": str(edm_path),
-            "warnings": edm.warnings,
-        }
-        print(json.dumps(halt_payload, indent=2, ensure_ascii=False))
-        return 2
-
-    slug = sanitize_filename_slug(args.title)
-    kdenlive_path, kdenlive_srt, standalone_srt = export_kdenlive_project(
-        edm=edm,
-        output_dir=job_dir,
-        project_basename=slug,
-    )
-    verification = verify_kdenlive_project(kdenlive_path, check_source_media_exists=True)
-    ver_path = safe_write_text(
-        job_dir / "verification_report.json",
-        verification.to_json(indent=2),
-        source_path=source_path,
-    )
-    verify_source_untouched(snap)
 
     result = {
         "status": "ok" if verification.is_valid else "verification_failed",
@@ -220,54 +284,55 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     snap = capture_source_snapshot(source_path)
     cfg = _config_from_args(args)
 
-    job_dir = create_unique_job_directory(
-        args.output_dir,
-        args.title,
-        source_path=source_path,
-    )
+    try:
+        job_dir = create_unique_job_directory(
+            args.output_dir,
+            args.title,
+            source_path=source_path,
+        )
 
-    report = analyze_recording(source_path, config=cfg)
-    report_path = safe_write_text(
-        job_dir / "analysis_report.json",
-        report.to_json(indent=2),
-        source_path=source_path,
-    )
+        report = analyze_recording(source_path, config=cfg)
+        report_path = safe_write_text(
+            job_dir / "analysis_report.json",
+            report.to_json(indent=2),
+            source_path=source_path,
+        )
 
-    edm = build_edit_decision_model(report, title=args.title, config=cfg)
-    edm_path = safe_write_text(
-        job_dir / "edit_decisions.json",
-        edm.to_json(indent=2),
-        source_path=source_path,
-    )
+        edm = build_edit_decision_model(report, title=args.title, config=cfg)
+        edm_path = safe_write_text(
+            job_dir / "edit_decisions.json",
+            edm.to_json(indent=2),
+            source_path=source_path,
+        )
 
-    if edm.low_confidence_halt:
+        if edm.low_confidence_halt:
+            halt_payload = {
+                "status": "halted_low_confidence",
+                "reason": "Overall edit confidence is below configured minimum; stopping for human review.",
+                "overall_confidence": edm.overall_confidence,
+                "min_required_confidence": cfg.min_overall_edit_confidence,
+                "job_dir": str(job_dir),
+                "analysis_report_json": str(report_path),
+                "edit_decisions_json": str(edm_path),
+                "warnings": edm.warnings,
+            }
+            print(json.dumps(halt_payload, indent=2, ensure_ascii=False))
+            return 2
+
+        slug = sanitize_filename_slug(args.title)
+        kdenlive_path, kdenlive_srt, standalone_srt = export_kdenlive_project(
+            edm=edm,
+            output_dir=job_dir,
+            project_basename=slug,
+        )
+        verification = verify_kdenlive_project(kdenlive_path, check_source_media_exists=True)
+        ver_path = safe_write_text(
+            job_dir / "verification_report.json",
+            verification.to_json(indent=2),
+            source_path=source_path,
+        )
+    finally:
         verify_source_untouched(snap)
-        halt_payload = {
-            "status": "halted_low_confidence",
-            "reason": "Overall edit confidence is below configured minimum; stopping for human review.",
-            "overall_confidence": edm.overall_confidence,
-            "min_required_confidence": cfg.min_overall_edit_confidence,
-            "job_dir": str(job_dir),
-            "analysis_report_json": str(report_path),
-            "edit_decisions_json": str(edm_path),
-            "warnings": edm.warnings,
-        }
-        print(json.dumps(halt_payload, indent=2, ensure_ascii=False))
-        return 2
-
-    slug = sanitize_filename_slug(args.title)
-    kdenlive_path, kdenlive_srt, standalone_srt = export_kdenlive_project(
-        edm=edm,
-        output_dir=job_dir,
-        project_basename=slug,
-    )
-    verification = verify_kdenlive_project(kdenlive_path, check_source_media_exists=True)
-    ver_path = safe_write_text(
-        job_dir / "verification_report.json",
-        verification.to_json(indent=2),
-        source_path=source_path,
-    )
-    verify_source_untouched(snap)
 
     output = {
         "status": "ok" if verification.is_valid else "verification_failed",

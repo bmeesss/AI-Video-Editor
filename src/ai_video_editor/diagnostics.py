@@ -156,7 +156,7 @@ def run_diagnostics() -> DiagnosticReport:
     ram_gb = get_system_ram_gb()
     cores = os.cpu_count() or 4
     cuda_ok = is_cuda_available()
-    rec_model = "small" if (cuda_ok or (ram_gb >= 12.0 and cores >= 8)) else "base"
+    rec_model = "small" if (ram_gb >= 16.0 and cores >= 8) else "base"
 
     all_req_ok = all(c.available for c in components if c.required)
 
